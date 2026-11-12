@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# VEGETAL: toma Felucca (hugelton/Felucca, commit fijo, con submódulos), le pone encima los archivos de overlay/,
+# compila el firmware (Linux x86-64: la toolchain de JieLi corre nativa), prueba el motor en el anfitrión de
+# Felucca, arma el sitio con el instalador web y lo publica en GitHub Pages.
+name: VEGETAL
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  VERSION: "1.8.1-vegetal2"
+  FELUCCA_REF: "a4f007c9211ea5b37298c01ff6d73430fe2cb96a"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Este repositorio (los archivos de VEGETAL)
+        uses: actions/checkout@v4
+        with:
+          path: vegetal
+
+      - name: Felucca (con submódulos)
+        uses: actions/checkout@v4
+        with:
+          repository: hugelton/Felucca
+          ref: ${{ env.FELUCCA_REF }}
+          submodules: recursive
+          path: felucca
+
+      - name: Aplicar VEGETAL sobre Felucca
+        run: cp -rv vegetal/overlay/. felucca/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dependencias de Python
+        run: pip install Pillow fonttools
+
+      - name: Caché de la toolchain y del SDK de JieLi
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.jieli
+            ~/fw-AC79_AIoT_SDK
+          key: jieli-toolchain-ac79-v1.2.1
+
+      - name: Toolchain de JieLi
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: felucca
+        run: sh tools/get_toolchain.sh "$HOME/.jieli"
+
+      - name: SDK AC79 (tres archivos)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse --branch AC79NN_SDK_V1.2.1_2023-12-13 \
+            https://gitee.com/Jieli-Tech/fw-AC79_AIoT_SDK.git "$HOME/fw-AC79_AIoT_SDK"
+          cd "$HOME/fw-AC79_AIoT_SDK"
+          git sparse-checkout set cpu/wl82/tools
+          ls -la cpu/wl82/tools/uboot.boot cpu/wl82/tools/cfg_tool.bin cpu/wl82/tools/cfg/eq_cfg_hw.bin
+
+      - name: Compilar el firmware
+        working-directory: felucca
+        run: ./build.sh --release "$VERSION"
+
+      - name: Probar el motor en el DSP de Felucca
+        working-directory: felucca
+        run: |
+          INC=$(find firmware -name '*.h' -printf '%h\n' | sort -u | sed 's/^/-I/' | tr '\n' ' ')
+          gcc -O2 -w -Ibuild/gen -Ifirmware/src $INC -o build/hostsim tests/hostsim.c -lm
+          for p in $(seq 0 20); do SECS=6 CHORD=3 PRESET=1 BENCH=1 ./build/hostsim 14 $p 0 build/vegetal_$p.wav; done
+
+      - name: Probar las notas por MIDI y el espejo (el firmware real, sin el FM-1)
+        working-directory: felucca
+        run: |
+          HALI="-Ifirmware/hal -Ifirmware/bsp/chip -Ifirmware/bsp/boards/fm1 -Ifirmware/src"
+          gcc -O1 -w $HALI -Ibuild/gen -o build/vegetal_out_test tests/vegetal_out_test.c -lm
+          ./build/vegetal_out_test
+          gcc -O1 -w $HALI -Ibuild/gen -o build/vegetal_stream tests/vegetal_stream.c -lm
+          ./build/vegetal_stream build/veg_stream.json
+
+      - name: Memoria del firmware (lo que queda libre; para saber si cabría Bluetooth)
+        working-directory: felucca
+        continue-on-error: true
+        run: |
+          E=$(ls build/*.elf 2>/dev/null | head -1); echo "ELF: $E"
+          nm "$E" | grep -E " (_bss_end|_pool_start|_pool_end)$" | tee /tmp/syms
+          python3 - <<'PY'
+          s = {l.split()[2]: int(l.split()[0], 16) for l in open('/tmp/syms') if len(l.split()) == 3}
+          ram0, ram_len, pool_len = 0x01C08000, 72 * 1024, 0x5A000
+          bss = s['_bss_end'] - ram0; pool = s['_pool_end'] - s['_pool_start']
+          print(f"RAM: {bss} de {ram_len} B (libres {ram_len - bss}); pool: {pool} de {pool_len} B (libres {pool_len - pool})")
+          print("Bluetooth MIDI con la pila propia de fm1-base pide ~37 KB de RAM y ~69 KB de pool (README de fm1-base).")
+          PY
+
+      - name: Armar el sitio
+        working-directory: felucca
+        run: |
+          python3 web/vegetal/make_site_vegetal.py "build/felucca-$VERSION.fwsc" "$VERSION" ../_site \
+            "https://github.com/${{ github.repository }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vegetal-${{ env.VERSION }}
+          path: |
+            _site/firmware/vegetal-*.fwsc
+            _site/firmware/SHA256SUMS
+            felucca/build/vegetal_*.wav
+            felucca/build/veg_stream.json
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
